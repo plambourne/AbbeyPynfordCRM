@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 
 // ---- Types ----
@@ -14,58 +15,19 @@ type Deal = {
   id: string;
   ap_number: number | null;
   company_id: string | null;
+  site_name: string | null;
   enquiry_date: string | null;
   tender_return_date: string | null;
   stage: string | null;
   probability: string | null;
   tender_value: number | string | null;
   salesperson: string | null;
-  estimated_start_date: string | null; // commencement date
+  estimated_start_date: string | null;
+  works_category: string | null;
+  works_subcategory: string | null;
 };
 
-// ---- Constants / helpers ----
-
-const STAGES = [
-  "Received",
-  "Qualified",
-  "In Review",
-  "Quote Submitted",
-  "Won",
-  "Lost",
-  "No Tender",
-];
-
-const PROB_WEIGHTS: Record<string, number> = {
-  A: 0.75,
-  B: 0.5,
-  C: 0.25,
-  D: 0.1,
-};
-
-// Edit these to your actual targets (per month, GBP)
-const MONTHLY_TARGETS: Record<string, number> = {
-  // "YYYY-MM": value
-  "2025-01": 500000,
-  "2025-02": 500000,
-  "2025-03": 750000,
-  "2025-04": 750000,
-  // etc...
-};
-
-const MONTH_NAMES = [
-  "Jan",
-  "Feb",
-  "Mar",
-  "Apr",
-  "May",
-  "Jun",
-  "Jul",
-  "Aug",
-  "Sep",
-  "Oct",
-  "Nov",
-  "Dec",
-];
+// ---- Helpers ----
 
 const toNumber = (value: number | string | null | undefined): number => {
   if (value === null || value === undefined) return 0;
@@ -82,11 +44,62 @@ const formatCurrency = (value: number | string | null | undefined): string => {
   }).format(n);
 };
 
-// Expected-value weight per deal:
-// - Won       -> 1 (100%)
-// - Lost      -> 0
-// - No Tender -> 0
-// - Otherwise -> A/B/C/D weight (or 0 if none)
+const formatAp = (apNumber: number | null): string => {
+  if (!apNumber) return "";
+  return `AP${apNumber}`;
+};
+
+// Canonical stage labels
+const STAGE_LABELS: Record<string, string> = {
+  received: "Received",
+  qualified: "Qualified",
+  "in review": "In Review",
+  "quote submitted": "Quote Submitted",
+  won: "Won",
+  lost: "Lost",
+  "no tender": "No Tender",
+};
+
+const ACTIVE_STAGE_NAMES = [
+  "Received",
+  "Qualified",
+  "In Review",
+  "Quote Submitted",
+];
+
+const ACTIVE_STAGE_SET = new Set(
+  ACTIVE_STAGE_NAMES.map((s) => s.toLowerCase())
+);
+
+const normaliseStage = (stage: string | null): string => {
+  if (!stage) return "Unspecified";
+  const raw = stage.trim();
+  if (!raw) return "Unspecified";
+  const key = raw.toLowerCase();
+  return STAGE_LABELS[key] ?? raw;
+};
+
+// ---- Multi-tender per AP: choose the "best" deal ----
+
+const STAGE_PRIORITY: Record<string, number> = {
+  lost: 0,
+  "no tender": 0,
+  received: 1,
+  qualified: 2,
+  "in review": 3,
+  "quote submitted": 4,
+  won: 5,
+};
+
+const PROB_WEIGHTS: Record<string, number> = {
+  A: 0.75,
+  B: 0.5,
+  C: 0.25,
+  D: 0.1,
+};
+const PROB_OPTIONS = ["A", "B", "C", "D"];
+
+
 const getDealWeight = (deal: Deal): number => {
   const stage = (deal.stage || "").toLowerCase();
   if (stage === "won") return 1;
@@ -98,78 +111,36 @@ const getDealWeight = (deal: Deal): number => {
   return 0;
 };
 
-type YoYRow = {
-  monthIndex: number;
-  monthName: string;
-  currentYearCount: number;
-  previousYearCount: number;
-};
-
-// ----- Helpers for forecast month range -----
-
-const monthIndexFromYyyyMm = (s: string): number | null => {
-  if (!s) return null;
-  const [yStr, mStr] = s.split("-");
-  const y = Number(yStr);
-  const m = Number(mStr);
-  if (!y || !m) return null;
-  return y * 12 + (m - 1); // monthIndex 0–11
-};
-
-const isDateInMonthRange = (dt: Date, fromMonth: string, toMonth: string): boolean => {
-  if (!fromMonth && !toMonth) return true;
-  const idx = dt.getFullYear() * 12 + dt.getMonth();
-
-  if (fromMonth) {
-    const fromIdx = monthIndexFromYyyyMm(fromMonth);
-    if (fromIdx !== null && idx < fromIdx) return false;
-  }
-
-  if (toMonth) {
-    const toIdx = monthIndexFromYyyyMm(toMonth);
-    if (toIdx !== null && idx > toIdx) return false;
-  }
-
-  return true;
-};
-
-// For “multiple tenders per AP”: pick the best deal per AP for forecasting
-const STAGE_PRIORITY: Record<string, number> = {
-  lost: 0,
-  "no tender": 0,
-  received: 1,
-  qualified: 2,
-  "in review": 3,
-  "quote submitted": 4,
-  won: 5,
-};
-
-const chooseBetterDealForForecast = (a: Deal, b: Deal): Deal => {
+const chooseBestDealForAp = (a: Deal, b: Deal): Deal => {
   const stageA = STAGE_PRIORITY[(a.stage || "").toLowerCase()] ?? 0;
   const stageB = STAGE_PRIORITY[(b.stage || "").toLowerCase()] ?? 0;
 
+  // 1) Highest stage wins
   if (stageA !== stageB) {
     return stageA > stageB ? a : b;
   }
 
+  // 2) Then highest probability weight (A/B/C/D)
   const weightA = getDealWeight(a);
   const weightB = getDealWeight(b);
   if (weightA !== weightB) {
     return weightA > weightB ? a : b;
   }
 
+  // 3) Then highest tender value
   const valA = toNumber(a.tender_value);
   const valB = toNumber(b.tender_value);
   if (valA !== valB) {
     return valA > valB ? a : b;
   }
 
-  // Fall back to newest enquiry_date
+  // 4) Then newest enquiry date
   const dA = a.enquiry_date ? new Date(a.enquiry_date).getTime() : 0;
   const dB = b.enquiry_date ? new Date(b.enquiry_date).getTime() : 0;
   return dA >= dB ? a : b;
 };
 
+// Collapse multiple deals per AP number into a single "best" deal
 const collapseDealsByAp = (deals: Deal[]): Deal[] => {
   const map = new Map<string, Deal>();
 
@@ -177,497 +148,767 @@ const collapseDealsByAp = (deals: Deal[]): Deal[] => {
     const key =
       d.ap_number !== null && d.ap_number !== undefined
         ? `AP-${d.ap_number}`
-        : `ID-${d.id}`; // no AP => own group
+        : `ID-${d.id}`; // no AP => its own group
 
     const existing = map.get(key);
     if (!existing) {
       map.set(key, d);
     } else {
-      map.set(key, chooseBetterDealForForecast(existing, d));
+      map.set(key, chooseBestDealForAp(existing, d));
     }
   });
 
   return Array.from(map.values());
 };
 
+// ---- Types for KPI groupings ----
+
+type BaseStageStat = {
+  stage: string; // canonical label
+  count: number;
+  total: number;
+};
+
+type StageGroup = {
+  key: "Active" | "Won" | "Lost" | "No Tender";
+  label: string;
+  count: number;
+  total: number;
+  children?: BaseStageStat[];
+};
+
+type ClientAgg = {
+  companyId: string;
+  companyName: string;
+  count: number;
+  wonCount: number;
+  totalValue: number;
+  wonValue: number;
+  expectedValue: number;
+};
+
+type PipelineBucket = {
+  monthKey: string; // YYYY-MM
+  label: string; // e.g. 03/2025
+  wonValue: number;
+  probAValue: number;
+  probBValue: number;
+};
+type FyTenderRow = {
+  fyEndYear: number;
+  tenders: number;
+  quotesSubmitted: number;
+  wonCount: number;
+  totalTenderValue: number;
+  wonTenderValue: number;
+};
+
+
+// ---- Financial year helpers ----
+// FY is Dec -> Nov, labelled by the calendar year it ends (e.g. FY2025 = Dec 2024–Nov 2025)
+
+const getFinancialYearEnd = (date: Date): number => {
+  const y = date.getFullYear();
+  const m = date.getMonth(); // 0–11
+  // December (11) belongs to next year's FY
+  return m === 11 ? y + 1 : y;
+};
+
+const isInFinancialYear = (date: Date, fyEndYear: number): boolean => {
+  const year = date.getFullYear();
+  const month = date.getMonth(); // 0–11
+
+  if (fyEndYear === year) {
+    // Jan–Nov of FY end year
+    return month >= 0 && month <= 10; // Jan–Nov
+  }
+  if (fyEndYear === year + 1) {
+    // Dec of previous year
+    return month === 11; // Dec
+  }
+  return false;
+};
+
+const monthIndexFromYyyyMm = (s: string): number | null => {
+  if (!s) return null;
+  const [yStr, mStr] = s.split("-");
+  const y = Number(yStr);
+  const m = Number(mStr);
+  if (!y || !m) return null;
+  return y * 12 + (m - 1);
+};
+
+// ---- Component ----
+
+type DateMode = "ALL" | "MONTH_RANGE" | "FY";
+type ClientSortBy = "WIN_RATE" | "COUNT" | "EXPECTED_VALUE";
+
 export default function DashboardPage() {
+  const router = useRouter();
+
   const [deals, setDeals] = useState<Deal[]>([]);
   const [companies, setCompanies] = useState<Company[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
-  // Filters (for most charts & KPIs – but NOT for the YoY enquiries section)
-  const [dateFrom, setDateFrom] = useState("");
-  const [dateTo, setDateTo] = useState("");
-  const [stageFilter, setStageFilter] = useState<string>(""); // "" = all
-  const [salespersonFilter, setSalespersonFilter] = useState<string>("");
+  // Global filters (applied to KPIs + table)
+  const [dateMode, setDateMode] = useState<DateMode>("ALL");
+  const [monthFrom, setMonthFrom] = useState<string>(""); // YYYY-MM
+  const [monthTo, setMonthTo] = useState<string>(""); // YYYY-MM
+  const [fyFilter, setFyFilter] = useState<string>(""); // e.g. "2025"
 
-  // Collapsible sections
-  const [showKpis, setShowKpis] = useState(true);
-  const [showYoy, setShowYoy] = useState(true);
-  const [showMonthly, setShowMonthly] = useState(true);
-  const [showForecast, setShowForecast] = useState(true);
-  const [showSalespeople, setShowSalespeople] = useState(true);
-  const [showTopClients, setShowTopClients] = useState(true);
+ const [salespersonFilter, setSalespersonFilter] = useState<string>("");
+const [categoryFilter, setCategoryFilter] = useState<string>("");
+const [subCategoryFilter, setSubCategoryFilter] = useState<string>("");
+const [probFilter, setProbFilter] = useState<string[]>([]);
 
-  // YoY enquiries: selected years
-  const [yoyYearCurrent, setYoyYearCurrent] = useState<number | null>(null);
-  const [yoyYearPrevious, setYoyYearPrevious] = useState<number | null>(null);
 
-  // Forecast filters
-  const [forecastFromMonth, setForecastFromMonth] = useState("");
-  const [forecastToMonth, setForecastToMonth] = useState("");
-  const [excludeStartedWon, setExcludeStartedWon] = useState(true);
+  // Stage filter (from clicking the stage breakdown)
+  const [stageFilter, setStageFilter] = useState<string | null>(null);
+  const [showActiveDetails, setShowActiveDetails] = useState(false);
 
-  // kept for future use (button removed from UI)
-  const handlePrint = () => {
-    if (typeof window !== "undefined") {
-      window.print();
-    }
-  };
+// Deals section collapsible
+const [showDeals, setShowDeals] = useState(false);
+
+// Deals table AP# sort (true = ascending, false = descending)
+const [apSortAsc, setApSortAsc] = useState<boolean>(true);
+
+// Top clients section collapsible
+const [showTopClients, setShowTopClients] = useState(false);
+
+// Financial year comparison collapsible
+const [showFyTenderSummary, setShowFyTenderSummary] = useState(false);
+
+// Top clients sort
+const [clientSortBy, setClientSortBy] =
+  useState<ClientSortBy>("WIN_RATE");
+
+
+
 
   useEffect(() => {
     const load = async () => {
-      setLoading(true);
+      try {
+        setLoading(true);
+        setError(null);
 
-      const [{ data: dealsData }, { data: companiesData }] = await Promise.all([
-        supabase
-          .from("deals")
-          .select(
-            "id, ap_number, company_id, enquiry_date, tender_return_date, stage, probability, tender_value, salesperson, estimated_start_date"
-          ),
-        supabase.from("companies").select("id, company_name"),
-      ]);
+        const [
+          { data: dealsData, error: dealsError },
+          { data: companiesData, error: companiesError },
+        ] = await Promise.all([
+          supabase
+            .from("deals")
+            .select(
+              `
+              id,
+              ap_number,
+              company_id,
+              site_name,
+              enquiry_date,
+              tender_return_date,
+              stage,
+              probability,
+              tender_value,
+              salesperson,
+              estimated_start_date,
+              works_category,
+              works_subcategory
+            `
+            ),
+          supabase.from("companies").select("id, company_name"),
+        ]);
 
-      setDeals((dealsData || []) as Deal[]);
-      setCompanies((companiesData || []) as Company[]);
-      setLoading(false);
+        if (dealsError) throw dealsError;
+        if (companiesError) throw companiesError;
+
+        setDeals((dealsData || []) as Deal[]);
+        setCompanies((companiesData || []) as Company[]);
+      } catch (err: any) {
+        console.error(err);
+        setError(err.message ?? "Failed to load data");
+      } finally {
+        setLoading(false);
+      }
     };
 
     void load();
   }, []);
 
-  // All distinct years (from all deals) for YoY selects
-  const allYears = useMemo(() => {
+  const getCompanyName = (companyId: string | null) => {
+    if (!companyId) return "";
+    const c = companies.find((co) => co.id === companyId);
+    return c?.company_name ?? "";
+  };
+
+  // ---- Distinct lists for filters ----
+
+  const distinctSalespeople = useMemo(() => {
+    const set = new Set<string>();
+    deals.forEach((d) => {
+      const name = (d.salesperson || "").trim();
+      if (name) set.add(name);
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [deals]);
+
+  const distinctCategories = useMemo(() => {
+    const set = new Set<string>();
+    deals.forEach((d) => {
+      const c = (d.works_category || "").trim();
+      if (c) set.add(c);
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [deals]);
+
+  const distinctSubCategories = useMemo(() => {
+    const set = new Set<string>();
+    deals.forEach((d) => {
+      const sc = (d.works_subcategory || "").trim();
+      if (!sc) return;
+      if (categoryFilter) {
+        const cat = (d.works_category || "").trim();
+        if (cat !== categoryFilter) return;
+      }
+      set.add(sc);
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [deals, categoryFilter]);
+
+  const distinctFinancialYears = useMemo(() => {
     const set = new Set<number>();
     deals.forEach((d) => {
       if (!d.enquiry_date) return;
       const dt = new Date(d.enquiry_date);
-      if (!Number.isNaN(dt.getTime())) {
-        set.add(dt.getFullYear());
-      }
+      if (Number.isNaN(dt.getTime())) return;
+      const fyEnd = getFinancialYearEnd(dt);
+      set.add(fyEnd);
     });
     return Array.from(set).sort((a, b) => a - b);
   }, [deals]);
 
-  // Initialise YoY years once we know the available years
-  useEffect(() => {
-    if (allYears.length === 0) return;
+  // ---- Apply global filters (date, salesperson, category) ----
 
-    setYoyYearCurrent((prev) => prev ?? allYears[allYears.length - 1]);
+   const baseFilteredDeals = useMemo(() => {
+    return deals.filter((d) => {
+      // Date filtering is based on enquiry_date
+      if (dateMode !== "ALL") {
+        if (!d.enquiry_date) return false;
+        const dt = new Date(d.enquiry_date);
+        if (Number.isNaN(dt.getTime())) return false;
 
-    setYoyYearPrevious((prev) =>
-      prev ??
-      (allYears.length > 1
-        ? allYears[allYears.length - 2]
-        : allYears[allYears.length - 1])
-    );
-  }, [allYears]);
+        if (dateMode === "MONTH_RANGE") {
+          const idx = dt.getFullYear() * 12 + dt.getMonth();
+          const fromIdx = monthFrom ? monthIndexFromYyyyMm(monthFrom) : null;
+          const toIdx = monthTo ? monthIndexFromYyyyMm(monthTo) : null;
 
-  // Helper: date filter (for enquiry_date, for most of the dashboard)
-  const isWithinDateRange = (d: Deal) => {
-    if (!dateFrom && !dateTo) return true;
-    if (!d.enquiry_date) return false;
+          if (fromIdx !== null && idx < fromIdx) return false;
+          if (toIdx !== null && idx > toIdx) return false;
+        }
 
-    const enquiry = new Date(d.enquiry_date);
-    if (Number.isNaN(enquiry.getTime())) return false;
+        if (dateMode === "FY" && fyFilter) {
+          const fyEndYear = Number(fyFilter);
+          if (!isInFinancialYear(dt, fyEndYear)) return false;
+        }
+      }
 
-    if (dateFrom) {
-      const from = new Date(dateFrom);
-      if (enquiry < from) return false;
-    }
+      // Salesperson filter
+      if (salespersonFilter) {
+        const sp = (d.salesperson || "").trim().toLowerCase();
+        if (sp !== salespersonFilter.toLowerCase()) return false;
+      }
 
-    if (dateTo) {
-      const to = new Date(dateTo);
-      to.setHours(23, 59, 59, 999);
-      if (enquiry > to) return false;
-    }
+      // Category filter
+      if (categoryFilter) {
+        const cat = (d.works_category || "").trim();
+        if (cat !== categoryFilter) return false;
+      }
 
-    return true;
-  };
+      // Sub-category filter
+      if (subCategoryFilter) {
+        const sc = (d.works_subcategory || "").trim();
+        if (sc !== subCategoryFilter) return false;
+      }
 
-  const filteredDeals = deals.filter((d) => {
-    if (!isWithinDateRange(d)) return false;
+      // 🔹 Probability multi-select filter (A/B/C/D)
+      if (probFilter.length > 0) {
+        const prob = (d.probability || "").trim().toUpperCase();
+        if (!prob || !probFilter.includes(prob)) return false;
+      }
 
-    if (stageFilter && d.stage !== stageFilter) return false;
+      return true;
+    });
+  }, [
+    deals,
+    dateMode,
+    monthFrom,
+    monthTo,
+    fyFilter,
+    salespersonFilter,
+    categoryFilter,
+    subCategoryFilter,
+    probFilter,
+  ]);
 
-    if (salespersonFilter) {
-      const sp = (d.salesperson || "").toLowerCase();
-      if (sp !== salespersonFilter.toLowerCase()) return false;
-    }
+  // ---- Collapsed deals (best per AP) after filters ----
 
-    return true;
-  });
-
-  // ---- GLOBAL KPIs (filtered) ----
-
-  const totalTender = filteredDeals.reduce(
-    (sum, d) => sum + toNumber(d.tender_value),
-    0
+  const collapsedDeals = useMemo(
+    () => collapseDealsByAp(baseFilteredDeals),
+    [baseFilteredDeals]
   );
 
-  const wonTender = filteredDeals
-    .filter((d) => (d.stage || "").toLowerCase() === "won")
-    .reduce((sum, d) => sum + toNumber(d.tender_value), 0);
+    // ---- Financial year tender numbers (ignores filters) ----
 
-  const expectedTender = filteredDeals.reduce(
-    (sum, d) => sum + toNumber(d.tender_value) * getDealWeight(d),
-    0
-  );
+  const fyTenderSummary = useMemo<FyTenderRow[]>(() => {
+    const map = new Map<number, FyTenderRow>();
 
-  const winRate = totalTender > 0 ? wonTender / totalTender : null;
-
-  // ---- Monthly pipeline & targets (filtered) ----
-
-  const monthlyBuckets = useMemo(() => {
-    const map = new Map<string, { total: number; won: number; target: number }>();
-
-    filteredDeals.forEach((d) => {
+    deals.forEach((d) => {
       if (!d.enquiry_date) return;
       const dt = new Date(d.enquiry_date);
       if (Number.isNaN(dt.getTime())) return;
-      const key = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}`;
 
-      const current =
-        map.get(key) || {
-          total: 0,
-          won: 0,
-          target: MONTHLY_TARGETS[key] || 0,
+      const fyEnd = getFinancialYearEnd(dt);
+
+      const row =
+        map.get(fyEnd) ||
+        {
+          fyEndYear: fyEnd,
+          tenders: 0,
+          quotesSubmitted: 0,
+          wonCount: 0,
+          totalTenderValue: 0,
+          wonTenderValue: 0,
         };
-      const val = toNumber(d.tender_value);
-      current.total += val;
-      if ((d.stage || "").toLowerCase() === "won") {
-        current.won += val;
+
+      row.tenders += 1;
+
+      const stageName = normaliseStage(d.stage);
+      const value = toNumber(d.tender_value);
+
+      if (stageName === "Quote Submitted") {
+        row.quotesSubmitted += 1;
       }
-      current.target = MONTHLY_TARGETS[key] || 0;
-      map.set(key, current);
+      if (stageName === "Won") {
+        row.wonCount += 1;
+        row.wonTenderValue += value;
+      }
+
+      row.totalTenderValue += value;
+
+      map.set(fyEnd, row);
     });
 
-    const arr = Array.from(map.entries()).map(([monthKey, v]) => ({
-      monthKey,
-      ...v,
-    }));
-    arr.sort((a, b) => a.monthKey.localeCompare(b.monthKey));
-    return arr;
-  }, [filteredDeals]);
+    return Array.from(map.values()).sort(
+      (a, b) => a.fyEndYear - b.fyEndYear
+    );
+  }, [deals]);
 
-  const maxMonthly = monthlyBuckets.reduce(
-    (max, m) => Math.max(max, m.total, m.won, m.target),
-    0
-  );
+  // ---- KPI calculations (using best-per-AP of filtered deals) ----
 
-  // ---- Forecast: by estimated start date, grouped by AP ----
+  const {
+    totalTenderValue,
+    groupedStageStats,
+    tendersReceived,
+    quotesSubmittedCount,
+    wonValue,
+  } = useMemo(() => {
+    let total = 0;
+    let tenders = 0;
+    let quotesSubmitted = 0;
+    let wonVal = 0;
 
-  const forecastBuckets = useMemo(() => {
-    if (deals.length === 0) return [];
+    const baseMap = new Map<string, BaseStageStat>();
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    collapsedDeals.forEach((d) => {
+      const value = toNumber(d.tender_value);
+      total += value;
+      tenders += 1;
 
-    // For forecast we respect salesperson filter, but ignore the enquiry date + stage filter.
-    const base = deals.filter((d) => {
-      if (salespersonFilter) {
-        const sp = (d.salesperson || "").toLowerCase();
-        if (sp !== salespersonFilter.toLowerCase()) return false;
+      const stageName = normaliseStage(d.stage);
+      const existing =
+        baseMap.get(stageName) || { stage: stageName, count: 0, total: 0 };
+
+      existing.count += 1;
+      existing.total += value;
+
+      baseMap.set(stageName, existing);
+
+      if (stageName === "Quote Submitted") {
+        quotesSubmitted += 1;
       }
-      return true;
+      if (stageName === "Won") {
+        wonVal += value;
+      }
     });
 
-    // Collapse multiple tenders per AP number to the "best" one
-    const collapsed = collapseDealsByAp(base);
+    
 
-    const map = new Map<
-      string,
+    const getStageStat = (name: string): BaseStageStat => {
+      return (
+        baseMap.get(name) || {
+          stage: name,
+          count: 0,
+          total: 0,
+        }
+      );
+    };
+
+    // Active = Received + Qualified + In Review + Quote Submitted
+    const activeChildren = ACTIVE_STAGE_NAMES.map((name) => getStageStat(name));
+    const activeGroup: StageGroup = {
+      key: "Active",
+      label: "Active",
+      count: activeChildren.reduce((s, c) => s + c.count, 0),
+      total: activeChildren.reduce((s, c) => s + c.total, 0),
+      children: activeChildren,
+    };
+
+    const won = getStageStat("Won");
+    const lost = getStageStat("Lost");
+    const noTender = getStageStat("No Tender");
+
+    const groups: StageGroup[] = [
+      activeGroup,
       {
-        total: number; // sum of full tender values
-        expected: number; // probability-weighted
-        won: number; // won in that month
-        target: number;
-      }
-    >();
+        key: "Won",
+        label: "Won",
+        count: won.count,
+        total: won.total,
+      },
+      {
+        key: "Lost",
+        label: "Lost",
+        count: lost.count,
+        total: lost.total,
+      },
+      {
+        key: "No Tender",
+        label: "No Tender",
+        count: noTender.count,
+        total: noTender.total,
+      },
+    ];
 
-    collapsed.forEach((d) => {
+    return {
+      totalTenderValue: total,
+      groupedStageStats: groups,
+      tendersReceived: tenders,
+      quotesSubmittedCount: quotesSubmitted,
+      wonValue: wonVal,
+    };
+  }, [collapsedDeals]);
+
+  // ---- Top clients (based on collapsed deals + filters) ----
+
+  const topClients = useMemo(() => {
+    const map = new Map<string, ClientAgg>();
+
+    collapsedDeals.forEach((d) => {
+      if (!d.company_id) return;
+
+      const companyId = d.company_id;
+      const companyName =
+        companies.find((c) => c.id === companyId)?.company_name ||
+        "Unknown";
+
+      const existing =
+        map.get(companyId) || {
+          companyId,
+          companyName,
+          count: 0,
+          wonCount: 0,
+          totalValue: 0,
+          wonValue: 0,
+          expectedValue: 0,
+        };
+
+      const value = toNumber(d.tender_value);
+      const stageName = normaliseStage(d.stage);
+      const weight = getDealWeight(d);
+
+      existing.count += 1;
+      existing.totalValue += value;
+      existing.expectedValue += value * weight;
+      if (stageName === "Won") {
+        existing.wonCount += 1;
+        existing.wonValue += value;
+      }
+
+      map.set(companyId, existing);
+    });
+
+    const arr = Array.from(map.values());
+    arr.sort((a, b) => {
+      if (clientSortBy === "COUNT") {
+        return b.count - a.count;
+      }
+      if (clientSortBy === "EXPECTED_VALUE") {
+        return b.expectedValue - a.expectedValue;
+      }
+      // WIN_RATE
+      const winRateA = a.count > 0 ? a.wonCount / a.count : 0;
+      const winRateB = b.count > 0 ? b.wonCount / b.count : 0;
+      if (winRateB !== winRateA) return winRateB - winRateA;
+      return b.count - a.count;
+    });
+
+    return arr;
+  }, [collapsedDeals, companies, clientSortBy]);
+
+  // ---- Pipeline by estimated start date (monthly, collapsed deals) ----
+
+  const { pipelineBuckets, maxPipelineValue } = useMemo(() => {
+    const map = new Map<string, PipelineBucket>();
+
+    collapsedDeals.forEach((d) => {
       if (!d.estimated_start_date) return;
       const dt = new Date(d.estimated_start_date);
       if (Number.isNaN(dt.getTime())) return;
 
-      // Only include deals whose start month is within the forecast range
-      if (!isDateInMonthRange(dt, forecastFromMonth, forecastToMonth)) {
-        return;
-      }
-
       const stage = (d.stage || "").toLowerCase();
       if (stage === "lost" || stage === "no tender") return;
 
-      // Won but already started = not pipeline → exclude (if checkbox ticked)
-      if (stage === "won" && excludeStartedWon && dt < today) {
-        return;
-      }
+      const year = dt.getFullYear();
+      const month = dt.getMonth() + 1;
+      const monthKey = `${year}-${String(month).padStart(2, "0")}`;
+      const label = `${String(month).padStart(2, "0")}/${year}`;
 
-      const monthKey = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(
-        2,
-        "0"
-      )}`;
-
-      const current =
+      const existing =
         map.get(monthKey) || {
-          total: 0,
-          expected: 0,
-          won: 0,
-          target: MONTHLY_TARGETS[monthKey] || 0,
+          monthKey,
+          label,
+          wonValue: 0,
+          probAValue: 0,
+          probBValue: 0,
         };
 
       const val = toNumber(d.tender_value);
-      const weight = getDealWeight(d);
+      const prob = (d.probability || "").toUpperCase();
 
-      current.total += val;
-      current.expected += val * weight;
       if (stage === "won") {
-        current.won += val;
+        existing.wonValue += val;
+      } else {
+        if (prob === "A") existing.probAValue += val;
+        if (prob === "B") existing.probBValue += val;
       }
-      current.target = MONTHLY_TARGETS[monthKey] || 0;
 
-      map.set(monthKey, current);
+      map.set(monthKey, existing);
     });
 
-    const arr = Array.from(map.entries()).map(([monthKey, v]) => ({
-      monthKey,
-      ...v,
-    }));
-    arr.sort((a, b) => a.monthKey.localeCompare(b.monthKey));
-    return arr;
-  }, [deals, salespersonFilter, forecastFromMonth, forecastToMonth, excludeStartedWon]);
+    const arr = Array.from(map.values()).sort((a, b) =>
+      a.monthKey.localeCompare(b.monthKey)
+    );
 
-  const maxForecast = forecastBuckets.reduce(
-    (max, m) => Math.max(max, m.total, m.expected, m.target),
-    0
-  );
+    const maxVal = arr.reduce(
+      (max, b) =>
+        Math.max(max, b.wonValue, b.probAValue, b.probBValue),
+      0
+    );
 
-  // ---- Salesperson breakdown (filtered) ----
+    return { pipelineBuckets: arr, maxPipelineValue: maxVal };
+  }, [collapsedDeals]);
 
-  const salespersonMap = useMemo(() => {
-    const map = new Map<
-      string,
-      {
-        name: string;
-        deals: number;
-        total: number;
-        won: number;
-        expected: number;
-      }
-    >();
+  // ---- Filtered deals for the table (global filters + stage filter, raw rows) ----
 
-    filteredDeals.forEach((d) => {
-      const name = d.salesperson?.trim() || "Unassigned";
-      const existing =
-        map.get(name) || {
-          name,
-          deals: 0,
-          total: 0,
-          won: 0,
-          expected: 0,
-        };
+const filteredDeals = useMemo(() => {
+  // When no stage filter: show all raw deals (line-by-line)
+  if (!stageFilter) return baseFilteredDeals;
 
-      const value = toNumber(d.tender_value);
-      existing.deals += 1;
-      existing.total += value;
-      if ((d.stage || "").toLowerCase() === "won") {
-        existing.won += value;
-      }
-      existing.expected += value * getDealWeight(d);
-
-      map.set(name, existing);
-    });
-
-    return Array.from(map.values()).sort((a, b) => b.total - a.total);
-  }, [filteredDeals]);
-
-  // ---- Top 10 clients this year (by won value) (all deals) ----
-
-  const now = new Date();
-  const currentYear = now.getFullYear();
-
-  const topClients = useMemo(() => {
-    const map = new Map<
-      string,
-      {
-        companyId: string;
-        companyName: string;
-        totalWon: number;
-        totalTender: number;
-      }
-    >();
-
-    deals.forEach((d) => {
-      if (!d.enquiry_date || !d.company_id) return;
-      const dt = new Date(d.enquiry_date);
-      if (Number.isNaN(dt.getTime())) return;
-      if (dt.getFullYear() !== currentYear) return;
-
-      const company = companies.find((c) => c.id === d.company_id);
-      const companyName = company?.company_name || "Unknown";
-
-      const existing =
-        map.get(d.company_id) || {
-          companyId: d.company_id,
-          companyName,
-          totalWon: 0,
-          totalTender: 0,
-        };
-
-      const val = toNumber(d.tender_value);
-      existing.totalTender += val;
-
-      if ((d.stage || "").toLowerCase() === "won") {
-        existing.totalWon += val;
-      }
-
-      map.set(d.company_id, existing);
-    });
-
-    return Array.from(map.values())
-      .sort((a, b) => b.totalWon - a.totalWon)
-      .slice(0, 10);
-  }, [deals, companies, currentYear]);
-
-  // ---- Distinct salespeople for filter ----
-
-  const distinctSalespeople = useMemo(
-    () =>
-      Array.from(new Set(deals.map((d) => (d.salesperson || "").trim())))
-        .filter(Boolean)
-        .sort((a, b) => a.localeCompare(b)),
-    [deals]
-  );
-
-  // ---- Enquiries / month YoY (ALL data, ignores filters) ----
-  const yoyData = useMemo(() => {
-    if (deals.length === 0 || yoyYearCurrent === null || yoyYearPrevious === null) {
-      return null;
+  // When stage filter is active: show best-per-AP list,
+  // so counts match the KPI / stage breakdown.
+  return collapsedDeals.filter((d) => {
+    const s = normaliseStage(d.stage);
+    if (stageFilter === "ACTIVE_GROUP") {
+      return ACTIVE_STAGE_SET.has(s.toLowerCase());
     }
+    return s === stageFilter;
+  });
+}, [baseFilteredDeals, collapsedDeals, stageFilter]);
+const sortedDeals = useMemo(() => {
+  // Copy the filtered deals into a new array so we don't mutate state
+  const arr = [...filteredDeals];
 
-    const buildYearMonthCounts = (year: number) => {
-      const map = new Map<number, number>();
-      deals.forEach((d) => {
-        if (!d.enquiry_date) return;
-        const dt = new Date(d.enquiry_date);
-        if (Number.isNaN(dt.getTime())) return;
-        if (dt.getFullYear() !== year) return;
-        const monthIndex = dt.getMonth(); // 0–11
-        map.set(monthIndex, (map.get(monthIndex) || 0) + 1);
-      });
-      return map;
-    };
+  arr.sort((a, b) => {
+    const aAp = a.ap_number;
+    const bAp = b.ap_number;
 
-    const currentMap = buildYearMonthCounts(yoyYearCurrent);
-    const prevMap = buildYearMonthCounts(yoyYearPrevious);
+    // Put rows with no AP# at the bottom
+    if (aAp == null && bAp == null) return 0;
+    if (aAp == null) return 1;
+    if (bAp == null) return -1;
 
-    const rows: YoYRow[] = [];
-    for (let i = 0; i < 12; i++) {
-      rows.push({
-        monthIndex: i,
-        monthName: MONTH_NAMES[i],
-        currentYearCount: currentMap.get(i) || 0,
-        previousYearCount: prevMap.get(i) || 0,
-      });
+    // Otherwise sort numerically by AP number
+    return apSortAsc ? aAp - bAp : bAp - aAp;
+  });
+
+  return arr;
+}, [filteredDeals, apSortAsc]);
+
+
+
+  const scrollToDealsTable = () => {
+    if (typeof window !== "undefined") {
+      const el = document.getElementById("deals-table");
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
     }
+  };
 
-    const totalCurrent = rows.reduce((sum, r) => sum + r.currentYearCount, 0);
-    const totalPrev = rows.reduce((sum, r) => sum + r.previousYearCount, 0);
+  const handleGroupRowClick = (groupKey: StageGroup["key"]) => {
+    if (groupKey === "Active") {
+      setStageFilter("ACTIVE_GROUP");
+    } else {
+      setStageFilter(groupKey);
+    }
+    scrollToDealsTable();
+  };
 
-    const avgCurrent = totalCurrent / 12;
-    const avgPrev = totalPrev / 12;
-    const delta = avgPrev > 0 ? (avgCurrent - avgPrev) / avgPrev : null;
+  const handleChildStageClick = (stageName: string) => {
+    setStageFilter(stageName);
+    scrollToDealsTable();
+  };
 
-    return {
-      currentYear: yoyYearCurrent,
-      previousYear: yoyYearPrevious,
-      rows,
-      avgCurrent,
-      avgPrev,
-      delta,
-    };
-  }, [deals, yoyYearCurrent, yoyYearPrevious]);
+  const clearStageFilter = () => setStageFilter(null);
 
+const handleResetFilters = () => {
+  setDateMode("ALL");
+  setMonthFrom("");
+  setMonthTo("");
+  setFyFilter("");
+  setSalespersonFilter("");
+  setCategoryFilter("");
+  setSubCategoryFilter("");
+  setProbFilter([]);
+  setStageFilter(null);
+};
+
+
+  // ---- Render ----
   return (
     <div className="p-6 space-y-6 bg-gray-50">
       {/* Header */}
       <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">
-            BD / Pipeline Dashboard
+            Abbey Pynford / Sales Dashboard
           </h1>
           <p className="text-sm text-gray-500">
-            High-level view of tenders, wins, and pipeline performance.
+            Filterable KPIs and deals (best-per-AP for totals), with click-through
+            to individual deals.
           </p>
         </div>
       </div>
 
-      {/* Filters */}
-      <section className="rounded border bg-white p-4 shadow-sm print:hidden">
+      {/* Filters bar */}
+      <section className="rounded border bg-white p-4 shadow-sm">
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-base font-semibold text-gray-800">
             Filters
           </h2>
+          <button
+            type="button"
+            onClick={handleResetFilters}
+            className="text-xs border rounded px-2 py-1 hover:bg-gray-50"
+          >
+            Reset all
+          </button>
         </div>
 
-        <div className="grid gap-3 md:grid-cols-4">
+        <div className="grid gap-3 md:grid-cols-4 text-xs">
+          {/* Date mode */}
+          <div className="md:col-span-2">
+            <div className="mb-1 text-gray-600">Date (by enquiry)</div>
+            <div className="flex flex-wrap gap-3 items-center">
+              <label className="inline-flex items-center gap-1">
+                <input
+                  type="radio"
+                  name="datemode"
+                  value="ALL"
+                  checked={dateMode === "ALL"}
+                  onChange={() => setDateMode("ALL")}
+                />
+                <span>All</span>
+              </label>
+              <label className="inline-flex items-center gap-1">
+                <input
+                  type="radio"
+                  name="datemode"
+                  value="MONTH_RANGE"
+                  checked={dateMode === "MONTH_RANGE"}
+                  onChange={() => setDateMode("MONTH_RANGE")}
+                />
+                <span>Month range</span>
+              </label>
+              <label className="inline-flex items-center gap-1">
+                <input
+                  type="radio"
+                  name="datemode"
+                  value="FY"
+                  checked={dateMode === "FY"}
+                  onChange={() => setDateMode("FY")}
+                />
+                <span>Financial year (Dec–Nov)</span>
+              </label>
+            </div>
+          </div>
+
+          {/* Month from */}
           <div>
-            <label className="mb-1 block text-xs text-gray-600">
-              Enquiry date from
+            <label className="block mb-1 text-gray-600">
+              Month from
             </label>
             <input
-              type="date"
-              value={dateFrom}
-              onChange={(e) => setDateFrom(e.target.value)}
-              className="w-full rounded border px-2 py-2 text-sm bg-white text-gray-900"
+              type="month"
+              value={monthFrom}
+              onChange={(e) => setMonthFrom(e.target.value)}
+              className="w-full border rounded px-2 py-1 text-xs"
+              disabled={dateMode !== "MONTH_RANGE"}
             />
           </div>
+
+          {/* Month to */}
           <div>
-            <label className="mb-1 block text-xs text-gray-600">
-              Enquiry date to
+            <label className="block mb-1 text-gray-600">
+              Month to
             </label>
             <input
-              type="date"
-              value={dateTo}
-              onChange={(e) => setDateTo(e.target.value)}
-              className="w-full rounded border px-2 py-2 text-sm bg-white text-gray-900"
+              type="month"
+              value={monthTo}
+              onChange={(e) => setMonthTo(e.target.value)}
+              className="w-full border rounded px-2 py-1 text-xs"
+              disabled={dateMode !== "MONTH_RANGE"}
             />
           </div>
+
+          {/* FY picker */}
           <div>
-            <label className="mb-1 block text-xs text-gray-600">
-              Stage
+            <label className="block mb-1 text-gray-600">
+              Financial year
             </label>
             <select
-              value={stageFilter}
-              onChange={(e) => setStageFilter(e.target.value)}
-              className="w-full rounded border px-2 py-2 text-sm bg-white text-gray-900"
+              value={fyFilter}
+              onChange={(e) => setFyFilter(e.target.value)}
+              disabled={dateMode !== "FY"}
+              className="w-full border rounded px-2 py-1 text-xs bg-white"
             >
-              <option value="">All stages</option>
-              {STAGES.map((s) => (
-                <option key={s} value={s}>
-                  {s}
+              <option value="">All</option>
+              {distinctFinancialYears.map((fy) => (
+                <option key={fy} value={fy}>
+                  FY{fy}
                 </option>
               ))}
             </select>
           </div>
+
+          {/* Salesperson */}
           <div>
-            <label className="mb-1 block text-xs text-gray-600">
+            <label className="block mb-1 text-gray-600">
               Salesperson
             </label>
             <select
               value={salespersonFilter}
               onChange={(e) => setSalespersonFilter(e.target.value)}
-              className="w-full rounded border px-2 py-2 text-sm bg-white text-gray-900"
+              className="w-full border rounded px-2 py-1 text-xs bg-white"
             >
               <option value="">All</option>
               {distinctSalespeople.map((sp) => (
@@ -675,667 +916,654 @@ export default function DashboardPage() {
                   {sp}
                 </option>
               ))}
-              {distinctSalespeople.length === 0 && (
-                <option value="" disabled>
-                  No salesperson data
+            </select>
+          </div>
+{/* Probability (multi-select) */}
+<div>
+  <label className="block mb-1 text-gray-600">
+    Probability (A/B/C/D)
+  </label>
+  <div className="flex flex-wrap gap-2">
+    {PROB_OPTIONS.map((p) => {
+      const checked = probFilter.includes(p);
+      return (
+        <label
+          key={p}
+          className="inline-flex items-center gap-1 text-xs"
+        >
+          <input
+            type="checkbox"
+            checked={checked}
+            onChange={() => {
+              setProbFilter((prev) =>
+                checked
+                  ? prev.filter((x) => x !== p)
+                  : [...prev, p]
+              );
+            }}
+          />
+          <span>{p}</span>
+        </label>
+      );
+    })}
+  </div>
+</div>
+
+          {/* Category */}
+          <div>
+            <label className="block mb-1 text-gray-600">
+              Work category
+            </label>
+            <select
+              value={categoryFilter}
+              onChange={(e) => {
+                setCategoryFilter(e.target.value);
+                setSubCategoryFilter("");
+              }}
+              className="w-full border rounded px-2 py-1 text-xs bg-white"
+            >
+              <option value="">All</option>
+              {distinctCategories.map((c) => (
+                <option key={c} value={c}>
+                  {c}
                 </option>
-              )}
+              ))}
+            </select>
+          </div>
+
+          {/* Sub-category */}
+          <div>
+            <label className="block mb-1 text-gray-600">
+              Work sub-category
+            </label>
+            <select
+              value={subCategoryFilter}
+              onChange={(e) => setSubCategoryFilter(e.target.value)}
+              className="w-full border rounded px-2 py-1 text-xs bg-white"
+              disabled={distinctSubCategories.length === 0}
+            >
+              <option value="">All</option>
+              {distinctSubCategories.map((sc) => (
+                <option key={sc} value={sc}>
+                  {sc}
+                </option>
+              ))}
             </select>
           </div>
         </div>
-        <div className="mt-3 flex justify-end">
-          <button
-            type="button"
-            onClick={() => {
-              setDateFrom("");
-              setDateTo("");
-              setStageFilter("");
-              setSalespersonFilter("");
-            }}
-            className="rounded border px-3 py-1 text-xs text-gray-700 hover:bg-gray-50"
-          >
-            Reset filters
-          </button>
-        </div>
       </section>
+
+      {/* State messages */}
+      {loading && (
+        <div className="rounded border bg-white p-4 shadow-sm">
+          <p className="text-sm text-gray-500">Loading data…</p>
+        </div>
+      )}
+
+      {error && (
+        <div className="rounded border bg-red-50 p-4 shadow-sm">
+          <p className="text-sm text-red-700">Error: {error}</p>
+        </div>
+      )}
 
       {/* KPIs */}
-      <section className="rounded border bg-white p-4 shadow-sm">
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="text-base font-semibold text-gray-800">
-            Key Metrics (filtered)
-          </h2>
-          <button
-            type="button"
-            onClick={() => setShowKpis((v) => !v)}
-            className="text-xs text-gray-500"
-          >
-            {showKpis ? "Hide" : "Show"}
-          </button>
-        </div>
+      {!loading && !error && (
+        <section className="rounded border bg-white p-4 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-base font-semibold text-gray-800">
+              Key metrics (best per AP, obeying filters)
+            </h2>
+          </div>
 
-        {showKpis && (
-          <>
-            {loading ? (
-              <p className="text-sm text-gray-500">Loading…</p>
-            ) : (
-              <div className="grid gap-4 md:grid-cols-4 text-sm">
-                <div className="border rounded p-3">
-                  <div className="text-gray-500 text-xs mb-1">
-                    Total tender value
-                  </div>
-                  <div className="text-xl font-bold">
-                    {formatCurrency(totalTender)}
-                  </div>
-                  <div className="text-xs text-gray-500 mt-1">
-                    Across {filteredDeals.length} deal
-                    {filteredDeals.length === 1 ? "" : "s"}
-                  </div>
-                </div>
-
-                <div className="border rounded p-3">
-                  <div className="text-gray-500 text-xs mb-1">
-                    Won value
-                  </div>
-                  <div className="text-xl font-bold">
-                    {formatCurrency(wonTender)}
-                  </div>
-                  <div className="text-xs text-gray-500 mt-1">
-                    Win rate (by value):{" "}
-                    {winRate == null
-                      ? "—"
-                      : `${Math.round(winRate * 100)}%`}
-                  </div>
-                </div>
-
-                <div className="border rounded p-3">
-                  <div className="text-gray-500 text-xs mb-1">
-                    Expected value
-                  </div>
-                  <div className="text-xl font-bold">
-                    {formatCurrency(expectedTender)}
-                  </div>
-                  <div className="text-xs text-gray-500 mt-1">
-                    Won = 100%, Lost / No Tender = 0, A/B/C/D weighted.
-                  </div>
-                </div>
-
-                <div className="border rounded p-3">
-                  <div className="text-gray-500 text-xs mb-1">
-                    Avg deal size
-                  </div>
-                  <div className="text-xl font-bold">
-                    {filteredDeals.length === 0
-                      ? "—"
-                      : formatCurrency(totalTender / filteredDeals.length)}
-                  </div>
-                  <div className="text-xs text-gray-500 mt-1">
-                    Based on filtered deals only.
-                  </div>
-                </div>
+          <div className="grid gap-4 md:grid-cols-2 text-sm">
+            {/* Total tender value + tender numbers */}
+            <div className="border rounded p-3 space-y-2">
+              <div className="text-xs text-gray-500">
+                Total tender value (all stages, best per AP#)
               </div>
-            )}
-          </>
-        )}
-      </section>
-
-      {/* Enquiries / month YoY (all data, specific years) */}
-      <section className="rounded border bg-white p-4 shadow-sm">
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="text-base font-semibold text-gray-800">
-            Enquiries per month – year-on-year
-          </h2>
-          <button
-            type="button"
-            onClick={() => setShowYoy((v) => !v)}
-            className="text-xs text-gray-500"
-          >
-            {showYoy ? "Hide" : "Show"}
-          </button>
-        </div>
-
-        {showYoy && (
-          <>
-            <p className="text-xs text-gray-500 mb-3">
-              Uses <strong>all enquiries in the system</strong> (ignores
-              the filters above). You can choose which years to compare.
-            </p>
-
-            {allYears.length === 0 ||
-            yoyYearCurrent === null ||
-            yoyYearPrevious === null ? (
-              <p className="text-sm text-gray-500">
-                Not enough data yet to calculate year-on-year enquiries.
-              </p>
-            ) : (
-              <>
-                {/* Year selectors */}
-                <div className="flex flex-wrap gap-3 mb-3 text-xs">
+              <div className="text-2xl font-bold">
+                {formatCurrency(totalTenderValue)}
+              </div>
+              <div className="text-xs text-gray-500">
+                Based on one &quot;best&quot; tender per AP number (highest
+                stage / probability / value) after applying the filters above.
+              </div>
+              <div className="mt-2 border-t pt-2 text-xs">
+                <div className="font-semibold mb-1">
+                  Tender numbers (filtered, best per AP)
+                </div>
+                <div className="flex flex-wrap gap-4">
                   <div>
-                    <label className="block text-gray-600 mb-1">
-                      Current year
-                    </label>
-                    <select
-                      value={yoyYearCurrent}
-                      onChange={(e) =>
-                        setYoyYearCurrent(Number(e.target.value) || null)
-                      }
-                      className="border rounded px-2 py-1 bg-white text-gray-900"
-                    >
-                      {allYears.map((y) => (
-                        <option key={y} value={y}>
-                          {y}
-                        </option>
-                      ))}
-                    </select>
+                    <div className="text-gray-500 text-[11px]">
+                      Tenders received
+                    </div>
+                    <div className="font-semibold">{tendersReceived}</div>
                   </div>
                   <div>
-                    <label className="block text-gray-600 mb-1">
-                      Comparison year
-                    </label>
-                    <select
-                      value={yoyYearPrevious}
-                      onChange={(e) =>
-                        setYoyYearPrevious(Number(e.target.value) || null)
-                      }
-                      className="border rounded px-2 py-1 bg-white text-gray-900"
-                    >
-                      {allYears.map((y) => (
-                        <option key={y} value={y}>
-                          {y}
-                        </option>
-                      ))}
-                    </select>
+                    <div className="text-gray-500 text-[11px]">
+                      Quotes submitted (stage)
+                    </div>
+                    <div className="font-semibold">
+                      {quotesSubmittedCount}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-gray-500 text-[11px]">
+                      Won value
+                    </div>
+                    <div className="font-semibold">
+                      {formatCurrency(wonValue)}
+                    </div>
                   </div>
                 </div>
-
-                {yoyData === null ? (
-                  <p className="text-sm text-gray-500">
-                    Not enough data for the selected years.
-                  </p>
-                ) : (
-                  <>
-                    {/* KPI row */}
-                    <div className="grid gap-4 md:grid-cols-3 text-sm mb-4">
-                      <div className="border rounded p-3">
-                        <div className="text-gray-500 text-xs mb-1">
-                          Avg enquiries / month ({yoyData.currentYear})
-                        </div>
-                        <div className="text-xl font-bold">
-                          {yoyData.avgCurrent.toFixed(1)}
-                        </div>
-                      </div>
-                      <div className="border rounded p-3">
-                        <div className="text-gray-500 text-xs mb-1">
-                          Avg enquiries / month ({yoyData.previousYear})
-                        </div>
-                        <div className="text-xl font-bold">
-                          {yoyData.avgPrev.toFixed(1)}
-                        </div>
-                      </div>
-                      <div className="border rounded p-3">
-                        <div className="text-gray-500 text-xs mb-1">
-                          Year-on-year change
-                        </div>
-                        <div className="text-xl font-bold">
-                          {yoyData.delta === null
-                            ? "—"
-                            : `${
-                                yoyData.delta >= 0 ? "+" : ""
-                              }${Math.round(yoyData.delta * 100)}%`}
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Month-by-month table */}
-                    <div className="overflow-x-auto">
-                      <table className="min-w-full text-xs border-collapse">
-                        <thead>
-                          <tr className="border-b">
-                            <th className="text-left p-2">Month</th>
-                            <th className="text-left p-2">
-                              Enquiries {yoyData.currentYear}
-                            </th>
-                            <th className="text-left p-2">
-                              Enquiries {yoyData.previousYear}
-                            </th>
-                            <th className="text-left p-2">Δ</th>
-                            <th className="text-left p-2">Δ %</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {yoyData.rows.map((r) => {
-                            const diff =
-                              r.currentYearCount - r.previousYearCount;
-                            const pct =
-                              r.previousYearCount > 0
-                                ? (diff / r.previousYearCount) * 100
-                                : null;
-                            return (
-                              <tr key={r.monthIndex} className="border-b">
-                                <td className="p-2">{r.monthName}</td>
-                                <td className="p-2">{r.currentYearCount}</td>
-                                <td className="p-2">{r.previousYearCount}</td>
-                                <td className="p-2">
-                                  {diff > 0
-                                    ? `+${diff}`
-                                    : diff === 0
-                                    ? "0"
-                                    : diff}
-                                </td>
-                                <td className="p-2">
-                                  {pct === null
-                                    ? "—"
-                                    : `${
-                                        pct >= 0 ? "+" : ""
-                                      }${Math.round(pct)}%`}
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
-                  </>
-                )}
-              </>
-            )}
-          </>
-        )}
-      </section>
-
-      {/* Forecast by estimated start date (pipeline) */}
-      <section className="rounded border bg-white p-4 shadow-sm">
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="mb-0 text-base font-semibold text-gray-800">
-            Forecast by estimated start date (pipeline)
-          </h2>
-          <button
-            type="button"
-            onClick={() => setShowForecast((v) => !v)}
-            className="text-xs text-gray-500"
-          >
-            {showForecast ? "Hide" : "Show"}
-          </button>
-        </div>
-
-        {showForecast && (
-          <>
-            <p className="text-xs text-gray-500 mb-3">
-              Uses <strong>estimated start date</strong> on each deal.
-              Multiple tenders for the same AP are collapsed to the{" "}
-              <strong>best</strong> tender (highest stage / probability).
-              Won jobs with a start date in the past are excluded from
-              pipeline if{" "}
-              <span className="font-semibold">
-                &quot;Exclude started Won jobs&quot;
-              </span>{" "}
-              is ticked. Deals marked <strong>No Tender</strong> are also
-              excluded from the pipeline.
-            </p>
-
-            {/* Forecast filters */}
-            <div className="flex flex-wrap gap-3 mb-4 text-xs">
-              <div>
-                <label className="block text-gray-600 mb-1">
-                  Start month from
-                </label>
-                <input
-                  type="month"
-                  value={forecastFromMonth}
-                  onChange={(e) => setForecastFromMonth(e.target.value)}
-                  className="border rounded px-2 py-1 bg-white text-gray-900"
-                />
               </div>
-              <div>
-                <label className="block text-gray-600 mb-1">
-                  Start month to
-                </label>
-                <input
-                  type="month"
-                  value={forecastToMonth}
-                  onChange={(e) => setForecastToMonth(e.target.value)}
-                  className="border rounded px-2 py-1 bg-white text-gray-900"
-                />
-              </div>
-              <label className="flex items-center gap-2 mt-5">
-                <input
-                  type="checkbox"
-                  checked={excludeStartedWon}
-                  onChange={(e) => setExcludeStartedWon(e.target.checked)}
-                />
-                <span className="text-gray-700">
-                  Exclude Won jobs with start date in the past
-                </span>
-              </label>
             </div>
 
-            {forecastBuckets.length === 0 ? (
-              <p className="text-sm text-gray-500">
-                No forecastable deals for the selected criteria.
-              </p>
-            ) : (
-              <div className="space-y-3 text-xs">
-                <div className="flex justify-end gap-4 text-[11px] text-gray-500">
-                  <span>
-                    <span className="inline-block w-3 h-3 rounded-full bg-blue-500 mr-1" />
-                    Total tender (per best AP)
-                  </span>
-                  <span>
-                    <span className="inline-block w-3 h-3 rounded-full bg-purple-500 mr-1" />
-                    Expected value (probability-weighted)
-                  </span>
-                  <span>
-                    <span className="inline-block w-3 h-3 rounded-full bg-gray-800 mr-1" />
-                    Target
-                  </span>
-                </div>
-                {forecastBuckets.map((m) => {
-                  const totalWidth =
-                    maxForecast > 0 ? (m.total / maxForecast) * 100 : 0;
-                  const expectedWidth =
-                    maxForecast > 0 ? (m.expected / maxForecast) * 100 : 0;
-                  const targetWidth =
-                    maxForecast > 0 ? (m.target / maxForecast) * 100 : 0;
-
-                  const [year, month] = m.monthKey.split("-");
-                  const label = `${month}/${year}`;
-
-                  return (
-                    <div key={m.monthKey} className="flex items-center gap-3">
-                      <div className="w-16 text-gray-700 text-xs">
-                        {label}
-                      </div>
-                      <div className="flex-1 space-y-1">
-                        <div className="h-3 bg-gray-100 rounded overflow-hidden">
-                          <div
-                            className="h-full bg-blue-500"
-                            style={{ width: `${totalWidth}%` }}
-                          />
-                        </div>
-                        <div className="h-3 bg-gray-100 rounded overflow-hidden">
-                          <div
-                            className="h-full bg-purple-500"
-                            style={{ width: `${expectedWidth}%` }}
-                          />
-                        </div>
-                        <div className="h-3 bg-gray-100 rounded overflow-hidden">
-                          <div
-                            className="h-full bg-gray-800"
-                            style={{ width: `${targetWidth}%` }}
-                          />
-                        </div>
-                      </div>
-                      <div className="w-48 text-right text-[11px]">
-                        <div>
-                          Total (best per AP): {formatCurrency(m.total)}
-                        </div>
-                        <div>
-                          Expected (weighted): {formatCurrency(m.expected)}
-                        </div>
-                        <div>
-                          Target: {formatCurrency(m.target)}
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
+            {/* Breakdown by grouped stage */}
+            <div className="border rounded p-3">
+              <div className="text-xs text-gray-500 mb-2">
+                Tender value by stage group (best per AP).{" "}
+                <span className="font-semibold">
+                  Active = Received, Qualified, In Review, Quote Submitted
+                </span>
+                . Click a row to filter, and expand Active to see its stages.
               </div>
-            )}
-          </>
-        )}
-      </section>
+              {groupedStageStats.length === 0 ? (
+                <p className="text-xs text-gray-500">
+                  No deals found to summarise.
+                </p>
+              ) : (
+                <div className="max-h-52 overflow-auto">
+                  <table className="min-w-full text-[11px] border-collapse">
+                    <thead>
+                      <tr className="border-b">
+                        <th className="text-left p-1">Stage / Group</th>
+                        <th className="text-right p-1"># leads</th>
+                        <th className="text-right p-1">Tender value</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {/* Active group row */}
+                      {groupedStageStats
+                        .filter((g) => g.key === "Active")
+                        .map((g) => (
+                          <tr
+                            key={g.key}
+                            className={`border-b cursor-pointer hover:bg-gray-50 ${
+                              stageFilter === "ACTIVE_GROUP"
+                                ? "bg-blue-50"
+                                : ""
+                            }`}
+                            onClick={() => handleGroupRowClick(g.key)}
+                          >
+                            <td className="p-1">
+                              <button
+                                type="button"
+                                className="inline-flex items-center gap-1 text-left"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setShowActiveDetails((v) => !v);
+                                }}
+                              >
+                                <span className="text-xs">
+                                  {showActiveDetails ? "▾" : "▸"}
+                                </span>
+                                <span className="font-semibold">
+                                  Active
+                                </span>
+                                <span className="text-[10px] text-gray-500">
+                                  (Received, Qualified, In Review, Quote
+                                  Submitted)
+                                </span>
+                              </button>
+                            </td>
+                            <td className="p-1 text-right">{g.count}</td>
+                            <td className="p-1 text-right">
+                              {formatCurrency(g.total)}
+                            </td>
+                          </tr>
+                        ))}
 
-      {/* Monthly chart + targets (filtered) */}
-      <section className="rounded border bg-white p-4 shadow-sm">
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="mb-0 text-base font-semibold text-gray-800">
-            Pipeline over time (monthly, filtered)
-          </h2>
-          <button
-            type="button"
-            onClick={() => setShowMonthly((v) => !v)}
-            className="text-xs text-gray-500"
-          >
-            {showMonthly ? "Hide" : "Show"}
-          </button>
-        </div>
+                      {/* Active children (detail rows) */}
+                      {showActiveDetails &&
+                        groupedStageStats
+                          .find((g) => g.key === "Active")
+                          ?.children?.map((child) => (
+                            <tr
+                              key={`active-${child.stage}`}
+                              className={`border-b cursor-pointer hover:bg-gray-50 ${
+                                stageFilter === child.stage ? "bg-blue-50" : ""
+                              }`}
+                              onClick={() =>
+                                handleChildStageClick(child.stage)
+                              }
+                            >
+                              <td className="p-1 pl-6">{child.stage}</td>
+                              <td className="p-1 text-right">
+                                {child.count}
+                              </td>
+                              <td className="p-1 text-right">
+                                {formatCurrency(child.total)}
+                              </td>
+                            </tr>
+                          ))}
 
-        {showMonthly && (
-          <>
-            {monthlyBuckets.length === 0 ? (
-              <p className="text-sm text-gray-500">
-                No deals match the current filters.
-              </p>
-            ) : (
-              <div className="space-y-3 text-xs">
-                <div className="flex justify-end gap-4 text-[11px] text-gray-500">
-                  <span>
-                    <span className="inline-block w-3 h-3 rounded-full bg-blue-500 mr-1" />
-                    Total tender
-                  </span>
-                  <span>
-                    <span className="inline-block w-3 h-3 rounded-full bg-green-500 mr-1" />
-                    Won
-                  </span>
-                  <span>
-                    <span className="inline-block w-3 h-3 rounded-full bg-gray-800 mr-1" />
-                    Target
-                  </span>
+                      {/* Other groups: Won, Lost, No Tender */}
+                      {groupedStageStats
+                        .filter((g) => g.key !== "Active")
+                        .map((g) => (
+                          <tr
+                            key={g.key}
+                            className={`border-b cursor-pointer hover:bg-gray-50 ${
+                              stageFilter === g.label ? "bg-blue-50" : ""
+                            }`}
+                            onClick={() => handleGroupRowClick(g.key)}
+                          >
+                            <td className="p-1">{g.label}</td>
+                            <td className="p-1 text-right">{g.count}</td>
+                            <td className="p-1 text-right">
+                              {formatCurrency(g.total)}
+                            </td>
+                          </tr>
+                        ))}
+                    </tbody>
+                  </table>
                 </div>
-                {monthlyBuckets.map((m) => {
-                  const totalWidth =
-                    maxMonthly > 0 ? (m.total / maxMonthly) * 100 : 0;
-                  const wonWidth =
-                    maxMonthly > 0 ? (m.won / maxMonthly) * 100 : 0;
-                  const targetWidth =
-                    maxMonthly > 0 ? (m.target / maxMonthly) * 100 : 0;
+              )}
+            </div>
+          </div>
+        </section>
+      )}
+            {/* Financial year tender numbers (ignores filters) */}
+      {!loading && !error && (
+        <section className="rounded border bg-white p-4 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-base font-semibold text-gray-800">
+              Financial year tender numbers (all data)
+            </h2>
+            <button
+              type="button"
+              onClick={() => setShowFyTenderSummary((v) => !v)}
+              className="border rounded px-2 py-1 text-[11px] hover:bg-gray-50"
+            >
+              {showFyTenderSummary ? "Hide" : "Show"}
+            </button>
+          </div>
 
-                  const [year, month] = m.monthKey.split("-");
-                  const label = `${month}/${year}`;
+          <p className="text-xs text-gray-500 mb-3">
+            Based on <strong>all deals in the system</strong>,{" "}
+            <span className="underline">ignoring the filters above</span>.
+            Financial year runs from December to November and is labelled
+            by the calendar year it ends (e.g. FY2025 = Dec 2024–Nov 2025).
+          </p>
 
-                  return (
-                    <div key={m.monthKey} className="flex items-center gap-3">
-                      <div className="w-16 text-gray-700 text-xs">
-                        {label}
-                      </div>
-                      <div className="flex-1 space-y-1">
-                        <div className="h-3 bg-gray-100 rounded overflow-hidden">
-                          <div
-                            className="h-full bg-blue-500"
-                            style={{ width: `${totalWidth}%` }}
-                          />
-                        </div>
-                        <div className="h-3 bg-gray-100 rounded overflow-hidden">
-                          <div
-                            className="h-full bg-green-500"
-                            style={{ width: `${wonWidth}%` }}
-                          />
-                        </div>
-                        <div className="h-3 bg-gray-100 rounded overflow-hidden">
-                          <div
-                            className="h-full bg-gray-800"
-                            style={{ width: `${targetWidth}%` }}
-                          />
-                        </div>
-                      </div>
-                      <div className="w-40 text-right text-[11px]">
-                        <div>
-                          Total: {formatCurrency(m.total)}
-                        </div>
-                        <div>
-                          Won: {formatCurrency(m.won)}
-                        </div>
-                        <div>
-                          Target: {formatCurrency(m.target)}
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </>
-        )}
-      </section>
-
-      {/* Salesperson breakdown (filtered) */}
-      <section className="rounded border bg-white p-4 shadow-sm">
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="mb-0 text-base font-semibold text-gray-800">
-            By salesperson / estimator (filtered)
-          </h2>
-          <button
-            type="button"
-            onClick={() => setShowSalespeople((v) => !v)}
-            className="text-xs text-gray-500"
-          >
-            {showSalespeople ? "Hide" : "Show"}
-          </button>
-        </div>
-
-        {showSalespeople && (
-          <>
-            {salespersonMap.length === 0 ? (
-              <p className="text-sm text-gray-500">
-                No deals match the current filters.
-              </p>
-            ) : (
-              <div className="overflow-x-auto">
-                <table className="min-w-full text-xs border-collapse">
-                  <thead>
-                    <tr className="border-b">
-                      <th className="text-left p-2">
-                        Salesperson
-                      </th>
-                      <th className="text-left p-2">Deals</th>
-                      <th className="text-left p-2">
-                        Total value
-                      </th>
-                      <th className="text-left p-2">
-                        Won value
-                      </th>
-                      <th className="text-left p-2">Win rate</th>
-                      <th className="text-left p-2">
-                        Expected value
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {salespersonMap.map((s) => {
-                      const winRateSp =
-                        s.total > 0 ? s.won / s.total : null;
-                      return (
-                        <tr key={s.name} className="border-b">
-                          <td className="p-2">{s.name}</td>
-                          <td className="p-2">{s.deals}</td>
-                          <td className="p-2">
-                            {formatCurrency(s.total)}
+          {showFyTenderSummary && (
+            <>
+              {fyTenderSummary.length === 0 ? (
+                <p className="text-sm text-gray-500">
+                  No data available for financial years.
+                </p>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="min-w-full text-xs border-collapse">
+                    <thead className="bg-gray-100">
+                      <tr className="border-b">
+                        <th className="text-left p-2">
+                          Financial year
+                        </th>
+                        <th className="text-right p-2">Tenders</th>
+                        <th className="text-right p-2">
+                          Quotes submitted
+                        </th>
+                        <th className="text-right p-2">Won count</th>
+                        <th className="text-right p-2">
+                          Total tender value
+                        </th>
+                        <th className="text-right p-2">
+                          Won tender value
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {fyTenderSummary.map((row) => (
+                        <tr key={row.fyEndYear} className="border-b">
+                          <td className="p-2">FY{row.fyEndYear}</td>
+                          <td className="p-2 text-right">
+                            {row.tenders}
                           </td>
-                          <td className="p-2">
-                            {formatCurrency(s.won)}
+                          <td className="p-2 text-right">
+                            {row.quotesSubmitted}
                           </td>
-                          <td className="p-2">
-                            {winRateSp == null
-                              ? "—"
-                              : `${Math.round(
-                                  winRateSp * 100
-                                )}%`}
+                          <td className="p-2 text-right">
+                            {row.wonCount}
                           </td>
-                          <td className="p-2">
-                            {formatCurrency(s.expected)}
+                          <td className="p-2 text-right">
+                            {formatCurrency(row.totalTenderValue)}
+                          </td>
+                          <td className="p-2 text-right">
+                            {formatCurrency(row.wonTenderValue)}
                           </td>
                         </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </>
-        )}
-      </section>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </>
+          )}
+        </section>
+      )}
 
-      {/* Top 10 clients this year (by won value) */}
-      <section className="rounded border bg-white p-4 shadow-sm">
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="mb-0 text-base font-semibold text-gray-800">
-            Top 10 clients this year (by won value)
-          </h2>
-          <button
-            type="button"
-            onClick={() => setShowTopClients((v) => !v)}
-            className="text-xs text-gray-500"
-          >
-            {showTopClients ? "Hide" : "Show"}
-          </button>
-        </div>
 
-        {showTopClients && (
-          <>
-            <p className="text-xs text-gray-500 mb-2">
-              Year: {currentYear}. Based on enquiry date and
-              &quot;Won&quot; deals.
+           {/* Deals table (collapsible) */}
+      {!loading && !error && (
+        <section
+          id="deals-table"
+          className="rounded border bg-white p-4 shadow-sm"
+        >
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-base font-semibold text-gray-800">
+              Deals
+            </h2>
+            <div className="flex items-center gap-3 text-xs text-gray-600">
+              {stageFilter ? (
+                <>
+                  <span>
+                    Stage filter:{" "}
+                    <strong>
+                      {stageFilter === "ACTIVE_GROUP"
+                        ? "Stage in (Received, Qualified, In Review, Quote Submitted)"
+                        : `Stage = ${stageFilter}`}
+                    </strong>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={clearStageFilter}
+                    className="border rounded px-2 py-1 text-[11px] hover:bg-gray-50"
+                  >
+                    Clear stage filter
+                  </button>
+                </>
+              ) : (
+                <span>Stage: All</span>
+              )}
+              <button
+                type="button"
+                onClick={() => setShowDeals((v) => !v)}
+                className="border rounded px-2 py-1 text-[11px] hover:bg-gray-50"
+              >
+                {showDeals ? "Hide deals" : "Show deals"}
+              </button>
+            </div>
+          </div>
+          
+
+          {showDeals && (
+            <>
+              <p className="text-xs text-gray-500 mb-3">
+                Showing{" "}
+                <span className="font-semibold">
+                  {filteredDeals.length}
+                </span>{" "}
+                of{" "}
+                <span className="font-semibold">
+                  {baseFilteredDeals.length}
+                </span>{" "}
+                deals after filters.
+              </p>
+
+              {filteredDeals.length === 0 ? (
+                <p className="text-sm text-gray-500">
+                  No deals match the current filters.
+                </p>
+              ) : (
+                <div className="overflow-x-auto max-h-[600px]">
+                  <table className="min-w-full text-xs border-collapse">
+                    <thead className="bg-gray-100 sticky top-0 z-10">
+                      <tr className="border-b">
+                           <th
+      className="text-left p-2 cursor-pointer select-none"
+      onClick={() => setApSortAsc((v) => !v)}
+    >
+      AP # {apSortAsc ? "▲" : "▼"}
+    </th>
+
+                        <th className="text-left p-2">Site name</th>
+                        <th className="text-left p-2">Company</th>
+                        <th className="text-left p-2">Salesperson</th>
+                        <th className="text-left p-2">Work category</th>
+                        <th className="text-left p-2">
+                          Work sub-category
+                        </th>
+                        <th className="text-left p-2">Enquiry date</th>
+                        <th className="text-left p-2">
+                          Tender return date
+                        </th>
+                        <th className="text-left p-2">Stage</th>
+                        <th className="text-left p-2">Prob</th>
+                        <th className="text-left p-2">Tender value</th>
+                        <th className="text-left p-2">Estimated start</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+  {sortedDeals.slice(0, 300).map((d) => (
+    <tr
+      key={d.id}
+      className="border-b hover:bg-gray-50 cursor-pointer"
+      onClick={() => router.push(`/deals/detail?id=${d.id}`)}
+    >
+      <td className="p-2 whitespace-nowrap">
+        {formatAp(d.ap_number)}
+      </td>
+      <td className="p-2">{d.site_name ?? ""}</td>
+      <td className="p-2">{getCompanyName(d.company_id)}</td>
+      <td className="p-2">{d.salesperson ?? ""}</td>
+      <td className="p-2">{d.works_category ?? ""}</td>
+      <td className="p-2">{d.works_subcategory ?? ""}</td>
+      <td className="p-2 whitespace-nowrap">
+        {d.enquiry_date ?? ""}
+      </td>
+      <td className="p-2 whitespace-nowrap">
+        {d.tender_return_date ?? ""}
+      </td>
+      <td className="p-2">{normaliseStage(d.stage)}</td>
+      <td className="p-2">{d.probability ?? ""}</td>
+      <td className="p-2 whitespace-nowrap">
+        {d.tender_value == null || d.tender_value === ""
+          ? ""
+          : formatCurrency(d.tender_value)}
+      </td>
+      <td className="p-2 whitespace-nowrap">
+        {d.estimated_start_date ?? ""}
+      </td>
+    </tr>
+  ))}
+</tbody>
+
+                  </table>
+                </div>
+              )}
+            </>
+          )}
+        </section>
+      )}
+
+      {/* Sales pipeline by estimated start date */}
+      {!loading && !error && (
+        <section className="rounded border bg-white p-4 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-base font-semibold text-gray-800">
+              Sales pipeline by estimated start (monthly)
+            </h2>
+          </div>
+          <p className="text-xs text-gray-500 mb-3">
+            Uses <strong>estimated start date</strong> and best-per-AP deals,
+            filtered by enquiry date / salesperson / category above. Shows{" "}
+            <strong>Won value</strong> and pipeline with{" "}
+            <strong>probability A</strong> and <strong>probability B</strong>.
+          </p>
+
+          {pipelineBuckets.length === 0 ? (
+            <p className="text-sm text-gray-500">
+              No forecastable deals for the selected criteria.
             </p>
-            {topClients.length === 0 ? (
-              <p className="text-sm text-gray-500">
-                No deals found for {currentYear}.
-              </p>
-            ) : (
-              <div className="overflow-x-auto">
-                <table className="min-w-full text-xs border-collapse">
-                  <thead>
-                    <tr className="border-b">
-                      <th className="text-left p-2">#</th>
-                      <th className="text-left p-2">Client</th>
-                      <th className="text-left p-2">
-                        Won value
-                      </th>
-                      <th className="text-left p-2">
-                        Total tender
-                      </th>
-                      <th className="text-left p-2">
-                        Win rate (by value)
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {topClients.map((c, idx) => {
-                      const winRateClient =
-                        c.totalTender > 0
-                          ? c.totalWon / c.totalTender
-                          : null;
-                      return (
-                        <tr key={c.companyId} className="border-b">
-                          <td className="p-2">
-                            {idx + 1}
-                          </td>
-                          <td className="p-2">
-                            {c.companyName}
-                          </td>
-                          <td className="p-2">
-                            {formatCurrency(c.totalWon)}
-                          </td>
-                          <td className="p-2">
-                            {formatCurrency(c.totalTender)}
-                          </td>
-                          <td className="p-2">
-                            {winRateClient == null
-                              ? "—"
-                              : `${Math.round(
-                                  winRateClient * 100
-                                )}%`}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
+          ) : (
+            <div className="space-y-3 text-xs">
+              <div className="flex justify-end gap-4 text-[11px] text-gray-500 mb-1">
+                <span>
+                  <span className="inline-block w-3 h-3 rounded-full bg-gray-800 mr-1" />
+                  Won value
+                </span>
+                <span>
+                  <span className="inline-block w-3 h-3 rounded-full bg-blue-500 mr-1" />
+                  Probability A
+                </span>
+                <span>
+                  <span className="inline-block w-3 h-3 rounded-full bg-purple-500 mr-1" />
+                  Probability B
+                </span>
               </div>
-            )}
-          </>
+              {pipelineBuckets.map((b) => {
+                const wonWidth =
+                  maxPipelineValue > 0
+                    ? (b.wonValue / maxPipelineValue) * 100
+                    : 0;
+                const aWidth =
+                  maxPipelineValue > 0
+                    ? (b.probAValue / maxPipelineValue) * 100
+                    : 0;
+                const bWidth =
+                  maxPipelineValue > 0
+                    ? (b.probBValue / maxPipelineValue) * 100
+                    : 0;
+
+                return (
+                  <div
+                    key={b.monthKey}
+                    className="flex items-center gap-3"
+                  >
+                    <div className="w-16 text-gray-700 text-xs">
+                      {b.label}
+                    </div>
+                    <div className="flex-1 space-y-1">
+                      <div className="h-3 bg-gray-100 rounded overflow-hidden">
+                        <div
+                          className="h-full bg-gray-800"
+                          style={{ width: `${wonWidth}%` }}
+                        />
+                      </div>
+                      <div className="h-3 bg-gray-100 rounded overflow-hidden">
+                        <div
+                          className="h-full bg-blue-500"
+                          style={{ width: `${aWidth}%` }}
+                        />
+                      </div>
+                      <div className="h-3 bg-gray-100 rounded overflow-hidden">
+                        <div
+                          className="h-full bg-purple-500"
+                          style={{ width: `${bWidth}%` }}
+                        />
+                      </div>
+                    </div>
+                    <div className="w-48 text-right text-[11px]">
+                      <div>Won: {formatCurrency(b.wonValue)}</div>
+                      <div>A: {formatCurrency(b.probAValue)}</div>
+                      <div>B: {formatCurrency(b.probBValue)}</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+      )}
+ {/* Top clients table */}
+{!loading && !error && (
+  <section className="rounded border bg-white p-4 shadow-sm">
+    <div className="flex items-center justify-between mb-3">
+      <h2 className="text-base font-semibold text-gray-800">
+        Top clients (subject to filters, best per AP)
+      </h2>
+      <div className="flex items-center gap-3 text-xs">
+        <div className="flex items-center gap-2">
+          <span className="text-gray-600">Sort by:</span>
+          <select
+            value={clientSortBy}
+            onChange={(e) =>
+              setClientSortBy(e.target.value as ClientSortBy)
+            }
+            className="border rounded px-2 py-1 bg-white"
+          >
+            <option value="WIN_RATE">Win %</option>
+            <option value="COUNT">Number of tenders</option>
+            <option value="EXPECTED_VALUE">Expected value</option>
+          </select>
+        </div>
+        <button
+          type="button"
+          onClick={() => setShowTopClients((v) => !v)}
+          className="border rounded px-2 py-1 text-[11px] hover:bg-gray-50"
+        >
+          {showTopClients ? "Hide clients" : "Show clients"}
+        </button>
+      </div>
+    </div>
+
+    {showTopClients && (
+      <>
+        {topClients.length === 0 ? (
+          <p className="text-sm text-gray-500">
+            No clients match the current filters.
+          </p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-xs border-collapse">
+              <thead className="bg-gray-100">
+                <tr className="border-b">
+                  <th className="text-left p-2">#</th>
+                  <th className="text-left p-2">Client</th>
+                  <th className="text-right p-2">Tenders</th>
+                  <th className="text-right p-2">Win %</th>
+                  <th className="text-right p-2">Won value</th>
+                  <th className="text-right p-2">Expected value</th>
+                  <th className="text-right p-2">
+                    Total tender value
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {topClients.slice(0, 50).map((c, idx) => {
+                  const winRate =
+                    c.count > 0 ? (c.wonCount / c.count) * 100 : 0;
+                  return (
+                    <tr key={c.companyId} className="border-b">
+                      <td className="p-2">{idx + 1}</td>
+                      <td className="p-2">{c.companyName}</td>
+                      <td className="p-2 text-right">{c.count}</td>
+                      <td className="p-2 text-right">
+                        {c.count === 0 ? "—" : `${Math.round(winRate)}%`}
+                      </td>
+                      <td className="p-2 text-right">
+                        {formatCurrency(c.wonValue)}
+                      </td>
+                      <td className="p-2 text-right">
+                        {formatCurrency(c.expectedValue)}
+                      </td>
+                      <td className="p-2 text-right">
+                        {formatCurrency(c.totalValue)}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
         )}
-      </section>
+      </>
+    )}
+  </section>
+)}
+
     </div>
   );
 }

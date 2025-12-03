@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { supabase } from "../../lib/supabaseClient";
-import { useCurrentStaff, StaffRole } from "../components/useCurrentStaff";
+import { supabase } from "@/lib/supabaseClient";
+import { supabaseAdmin } from "@/lib/supabaseAdmin";
+import { useCurrentStaff, StaffRole } from "@/app/components/useCurrentStaff";
 
 type StaffProfile = {
   id: string;
@@ -22,17 +23,12 @@ const ROLE_OPTIONS: { value: StaffRole; label: string }[] = [
 ];
 
 export default function StaffAdminPage() {
-  // Who am I?
-  const {
-    staff: currentStaff,
-    loading: currentStaffLoading,
-  } = useCurrentStaff();
+  const { staff: currentStaff, loading: currentStaffLoading } = useCurrentStaff();
 
   const isAdminOrManager =
     currentStaff &&
     (currentStaff.role === "admin" || currentStaff.role === "manager");
 
-  // Local state for staff list
   const [staff, setStaff] = useState<StaffProfile[]>([]);
   const [loading, setLoading] = useState(true);
   const [savingId, setSavingId] = useState<string | null>(null);
@@ -42,7 +38,7 @@ export default function StaffAdminPage() {
   const [roleFilter, setRoleFilter] = useState<string>("");
   const [activeFilter, setActiveFilter] = useState<"all" | "active" | "inactive">("all");
 
-  // Editing
+  // Edit state
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState<{
     full_name: string;
@@ -51,14 +47,30 @@ export default function StaffAdminPage() {
     is_active: boolean;
   } | null>(null);
 
-  // Load staff (only if admin/manager)
+  // Add user modal
+  const [newUserModalOpen, setNewUserModalOpen] = useState(false);
+  const [newUserForm, setNewUserForm] = useState({
+    email: "",
+    full_name: "",
+    role: "staff" as StaffRole,
+  });
+  const [creatingUser, setCreatingUser] = useState(false);
+
+  // Reset password loading
+  const [resettingId, setResettingId] = useState<string | null>(null);
+
+  // Deactivate & delete loading
+  const [deactivatingId, setDeactivatingId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  // Load staff list from staff_profiles
   const loadStaff = async () => {
     setLoading(true);
     setError(null);
 
     const { data, error } = await supabase
       .from("staff_profiles")
-      .select("id, full_name, email, role, is_active, created_at")
+      .select("*")
       .order("full_name", { ascending: true });
 
     if (error) {
@@ -77,7 +89,7 @@ export default function StaffAdminPage() {
     }
   }, [currentStaffLoading, isAdminOrManager]);
 
-  // Filtering
+  // Filtered output
   const filteredStaff = useMemo(() => {
     return staff.filter((s) => {
       if (roleFilter && s.role !== roleFilter) return false;
@@ -89,6 +101,7 @@ export default function StaffAdminPage() {
     });
   }, [staff, roleFilter, activeFilter]);
 
+  // === Editing ===
   const handleStartEdit = (s: StaffProfile) => {
     setEditingId(s.id);
     setEditForm({
@@ -105,30 +118,27 @@ export default function StaffAdminPage() {
   };
 
   const handleEditChange = (
-  e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>
-) => {
-  if (!editForm) return;
+    e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>
+  ) => {
+    if (!editForm) return;
+    const target = e.target;
+    const { name, value } = target;
 
-  const target = e.target as HTMLInputElement | HTMLSelectElement;
-  const { name, value } = target;
+    let fieldValue: string | boolean = value;
 
-  let fieldValue: string | boolean = value;
+    if (target instanceof HTMLInputElement && target.type === "checkbox") {
+      fieldValue = target.checked;
+    }
 
-  // Narrow to checkbox input before using `checked`
-  if (target instanceof HTMLInputElement && target.type === "checkbox") {
-    fieldValue = target.checked;
-  }
-
-  setEditForm((prev) =>
-    prev
-      ? {
-          ...prev,
-          [name]: fieldValue,
-        }
-      : prev
-  );
-};
-
+    setEditForm((prev) =>
+      prev
+        ? {
+            ...prev,
+            [name]: fieldValue,
+          }
+        : prev
+    );
+  };
 
   const handleSaveEdit = async () => {
     if (!editingId || !editForm) return;
@@ -138,53 +148,39 @@ export default function StaffAdminPage() {
 
     const { full_name, email, role, is_active } = editForm;
 
-    const { error } = await supabase
-      .from("staff_profiles")
-      .update({
-        full_name: full_name.trim(),
-        email: email.trim(),
+    // Call API route
+    const res = await fetch("/api/users/update", {
+      method: "POST",
+      body: JSON.stringify({
+        id: editingId,
+        full_name,
+        email,
         role,
         is_active,
-      })
-      .eq("id", editingId);
-
-    if (error) {
-      console.error("Error updating staff member:", error);
-      setError("Could not save changes.");
-    } else {
-      setStaff((prev) =>
-        prev.map((s) =>
-          s.id === editingId
-            ? {
-                ...s,
-                full_name: full_name.trim(),
-                email: email.trim(),
-                role,
-                is_active,
-              }
-            : s
-        )
-      );
-      setEditingId(null);
-      setEditForm(null);
-    }
+      }),
+    });
 
     setSavingId(null);
+
+    if (!res.ok) {
+      setError("Could not save staff member.");
+      return;
+    }
+
+    // Refresh list
+    await loadStaff();
+    setEditingId(null);
+    setEditForm(null);
   };
 
   const formatDate = (v: string) =>
     v ? new Date(v).toLocaleDateString() : "—";
-
-  // -----------------------
-  // Permission gate
-  // -----------------------
+  // ========= PERMISSION GATE =========
   if (currentStaffLoading) {
     return (
       <div className="p-6">
-        <h1 className="text-2xl font-bold text-gray-900">Staff admin</h1>
-        <p className="mt-2 text-sm text-gray-500">
-          Checking your permissions…
-        </p>
+        <h1 className="text-2xl font-bold">Staff admin</h1>
+        <p className="text-sm text-gray-600">Checking your permissions…</p>
       </div>
     );
   }
@@ -192,18 +188,15 @@ export default function StaffAdminPage() {
   if (!currentStaff || !isAdminOrManager) {
     return (
       <div className="p-6">
-        <h1 className="text-2xl font-bold text-gray-900">Staff admin</h1>
-        <p className="mt-2 text-sm text-gray-500">
-          You do not have permission to view this page. If you believe this is an
-          error, please contact an admin.
+        <h1 className="text-2xl font-bold">Staff admin</h1>
+        <p className="text-sm text-gray-600">
+          You do not have permission to view this page.
         </p>
       </div>
     );
   }
 
-  // -----------------------
-  // Main content (for admins/managers only)
-  // -----------------------
+  // ========= MAIN RENDER =========
   return (
     <div className="p-6 space-y-6">
       {/* Header */}
@@ -211,9 +204,16 @@ export default function StaffAdminPage() {
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Staff admin</h1>
           <p className="text-sm text-gray-500">
-            Manage internal users, their roles, and whether they’re active.
+            Manage internal users, their roles, and account status.
           </p>
         </div>
+
+        <button
+          className="rounded bg-blue-600 text-white px-3 py-1 text-sm hover:bg-blue-700"
+          onClick={() => setNewUserModalOpen(true)}
+        >
+          + Add New User
+        </button>
       </div>
 
       {/* Filters */}
@@ -222,8 +222,9 @@ export default function StaffAdminPage() {
           <h2 className="text-base font-semibold text-gray-800">Filters</h2>
 
           <div className="flex flex-wrap gap-3 text-xs">
+            {/* Role filter */}
             <div>
-              <label className="mb-1 block text-gray-600">Role</label>
+              <label className="text-gray-600 block mb-1">Role</label>
               <select
                 value={roleFilter}
                 onChange={(e) => setRoleFilter(e.target.value)}
@@ -238,8 +239,9 @@ export default function StaffAdminPage() {
               </select>
             </div>
 
+            {/* Active filter */}
             <div>
-              <label className="mb-1 block text-gray-600">Active status</label>
+              <label className="text-gray-600 block mb-1">Active status</label>
               <select
                 value={activeFilter}
                 onChange={(e) =>
@@ -255,11 +257,11 @@ export default function StaffAdminPage() {
 
             <button
               type="button"
+              className="self-end underline text-gray-500"
               onClick={() => {
                 setRoleFilter("");
                 setActiveFilter("all");
               }}
-              className="self-end text-xs text-gray-500 underline"
             >
               Clear filters
             </button>
@@ -272,8 +274,7 @@ export default function StaffAdminPage() {
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-base font-semibold text-gray-800">Staff list</h2>
           <p className="text-xs text-gray-500">
-            Showing {filteredStaff.length} of {staff.length} staff member
-            {staff.length === 1 ? "" : "s"}.
+            Showing {filteredStaff.length} of {staff.length} staff.
           </p>
         </div>
 
@@ -288,24 +289,12 @@ export default function StaffAdminPage() {
             <table className="min-w-full border-collapse text-sm">
               <thead>
                 <tr className="border-b bg-gray-50">
-                  <th className="text-left p-2 text-xs font-semibold uppercase tracking-wide text-gray-500">
-                    Name
-                  </th>
-                  <th className="text-left p-2 text-xs font-semibold uppercase tracking-wide text-gray-500">
-                    Email
-                  </th>
-                  <th className="text-left p-2 text-xs font-semibold uppercase tracking-wide text-gray-500">
-                    Role
-                  </th>
-                  <th className="text-left p-2 text-xs font-semibold uppercase tracking-wide text-gray-500">
-                    Active
-                  </th>
-                  <th className="text-left p-2 text-xs font-semibold uppercase tracking-wide text-gray-500">
-                    Created
-                  </th>
-                  <th className="text-left p-2 text-xs font-semibold uppercase tracking-wide text-gray-500">
-                    Actions
-                  </th>
+                  <th className="text-left p-2 text-xs font-semibold uppercase tracking-wide text-gray-500">Name</th>
+                  <th className="text-left p-2 text-xs font-semibold uppercase tracking-wide text-gray-500">Email</th>
+                  <th className="text-left p-2 text-xs font-semibold uppercase tracking-wide text-gray-500">Role</th>
+                  <th className="text-left p-2 text-xs font-semibold uppercase tracking-wide text-gray-500">Active</th>
+                  <th className="text-left p-2 text-xs font-semibold uppercase tracking-wide text-gray-500">Created</th>
+                  <th className="text-left p-2 text-xs font-semibold uppercase tracking-wide text-gray-500">Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -316,12 +305,12 @@ export default function StaffAdminPage() {
                     <tr key={s.id} className="border-b align-top">
                       {/* Name */}
                       <td className="p-2">
-                        {isEditing && editForm ? (
+                        {isEditing ? (
                           <input
                             name="full_name"
-                            value={editForm.full_name}
+                            value={editForm?.full_name || ""}
                             onChange={handleEditChange}
-                            className="w-full rounded border px-2 py-1 text-xs bg-white text-gray-900"
+                            className="w-full rounded border px-2 py-1 text-xs"
                           />
                         ) : (
                           <div className="font-medium">{s.full_name}</div>
@@ -330,27 +319,26 @@ export default function StaffAdminPage() {
 
                       {/* Email */}
                       <td className="p-2">
-                        {isEditing && editForm ? (
+                        {isEditing ? (
                           <input
                             name="email"
-                            type="email"
-                            value={editForm.email}
+                            value={editForm?.email || ""}
                             onChange={handleEditChange}
-                            className="w-full rounded border px-2 py-1 text-xs bg-white text-gray-900"
+                            className="w-full rounded border px-2 py-1 text-xs"
                           />
                         ) : (
-                          <div className="text-xs text-gray-700">{s.email}</div>
+                          <div className="text-xs">{s.email}</div>
                         )}
                       </td>
 
                       {/* Role */}
                       <td className="p-2">
-                        {isEditing && editForm ? (
+                        {isEditing ? (
                           <select
                             name="role"
-                            value={editForm.role}
+                            value={editForm?.role}
                             onChange={handleEditChange}
-                            className="rounded border px-2 py-1 text-xs bg-white text-gray-900"
+                            className="rounded border px-2 py-1 text-xs bg-white"
                           >
                             {ROLE_OPTIONS.map((r) => (
                               <option key={r.value} value={r.value}>
@@ -360,7 +348,7 @@ export default function StaffAdminPage() {
                           </select>
                         ) : (
                           <span className="inline-block rounded bg-gray-100 px-2 py-0.5 text-[11px] text-gray-700">
-                            {ROLE_OPTIONS.find((r) => r.value === s.role)?.label ??
+                            {ROLE_OPTIONS.find((r) => r.value === s.role)?.label ||
                               s.role}
                           </span>
                         )}
@@ -368,12 +356,12 @@ export default function StaffAdminPage() {
 
                       {/* Active */}
                       <td className="p-2">
-                        {isEditing && editForm ? (
+                        {isEditing ? (
                           <label className="inline-flex items-center gap-1 text-xs">
                             <input
                               type="checkbox"
                               name="is_active"
-                              checked={editForm.is_active}
+                              checked={editForm?.is_active || false}
                               onChange={handleEditChange}
                             />
                             <span>Active</span>
@@ -392,36 +380,96 @@ export default function StaffAdminPage() {
                       </td>
 
                       {/* Created */}
-                      <td className="p-2 text-xs">{formatDate(s.created_at)}</td>
-
-                      {/* Actions */}
                       <td className="p-2 text-xs">
+                        {formatDate(s.created_at)}
+                      </td>
+
+                      {/* ACTIONS */}
+                      <td className="p-2 text-xs space-x-2">
+
                         {isEditing ? (
-                          <div className="flex gap-2">
+                          <>
                             <button
-                              type="button"
+                              className="rounded bg-green-600 px-3 py-1 text-[11px] text-white hover:bg-green-700"
                               onClick={handleSaveEdit}
                               disabled={savingId === s.id}
-                              className="rounded bg-green-600 px-3 py-1 text-[11px] font-semibold text-white hover:bg-green-700 disabled:opacity-60"
                             >
                               {savingId === s.id ? "Saving…" : "Save"}
                             </button>
                             <button
-                              type="button"
+                              className="rounded border px-3 py-1 text-[11px]"
                               onClick={handleCancelEdit}
-                              className="rounded border px-3 py-1 text-[11px] text-gray-700 hover:bg-gray-50"
                             >
                               Cancel
                             </button>
-                          </div>
+                          </>
                         ) : (
-                          <button
-                            type="button"
-                            onClick={() => handleStartEdit(s)}
-                            className="rounded border px-3 py-1 text-[11px] text-gray-700 hover:bg-gray-50"
-                          >
-                            Edit
-                          </button>
+                          <>
+                            <button
+                              className="rounded border px-3 py-1 text-[11px] hover:bg-gray-50"
+                              onClick={() => handleStartEdit(s)}
+                            >
+                              Edit
+                            </button>
+
+                            {/* Reset Password, Deactivate, Delete → Filled in Chunk 3 */}
+                            {/* RESET PASSWORD */}
+<button
+  className="text-blue-600 underline text-[11px]"
+  onClick={async () => {
+    setResettingId(s.id);
+    await fetch("/api/users/reset-password", {
+      method: "POST",
+      body: JSON.stringify({ email: s.email }),
+    });
+    setResettingId(null);
+    alert("Password reset email sent.");
+  }}
+  disabled={resettingId === s.id}
+>
+  {resettingId === s.id ? "Sending…" : "Reset Password"}
+</button>
+
+{/* DEACTIVATE */}
+<button
+  className="text-orange-600 underline text-[11px]"
+  onClick={async () => {
+    if (!confirm("Deactivate this user?")) return;
+
+    setDeactivatingId(s.id);
+    await fetch("/api/users/deactivate", {
+      method: "POST",
+      body: JSON.stringify({ id: s.id }),
+    });
+    setDeactivatingId(null);
+    await loadStaff();
+  }}
+  disabled={deactivatingId === s.id}
+>
+  {deactivatingId === s.id ? "Deactivating…" : "Deactivate"}
+</button>
+
+{/* DELETE */}
+<button
+  className="text-red-600 underline text-[11px]"
+  onClick={async () => {
+    if (!confirm("Are you SURE you want to permanently delete this user?"))
+      return;
+
+    setDeletingId(s.id);
+    await fetch("/api/users/delete", {
+      method: "POST",
+      body: JSON.stringify({ id: s.id }),
+    });
+    setDeletingId(null);
+    await loadStaff();
+  }}
+  disabled={deletingId === s.id}
+>
+  {deletingId === s.id ? "Deleting…" : "Delete"}
+</button>
+
+                          </>
                         )}
                       </td>
                     </tr>
@@ -432,6 +480,95 @@ export default function StaffAdminPage() {
           </div>
         )}
       </section>
+     
+      {/* ======================= ADD USER MODAL ======================= */}
+
+
+      {newUserModalOpen && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div className="bg-white p-6 rounded shadow-lg w-full max-w-sm space-y-4">
+
+            <h2 className="text-lg font-semibold">Add New User</h2>
+
+            <input
+              className="w-full border p-2 rounded text-sm"
+              placeholder="Email"
+              value={newUserForm.email}
+              onChange={(e) =>
+                setNewUserForm({ ...newUserForm, email: e.target.value })
+              }
+            />
+
+            <input
+              className="w-full border p-2 rounded text-sm"
+              placeholder="Full Name"
+              value={newUserForm.full_name}
+              onChange={(e) =>
+                setNewUserForm({ ...newUserForm, full_name: e.target.value })
+              }
+            />
+
+            <select
+              className="w-full border p-2 rounded text-sm bg-white"
+              value={newUserForm.role}
+              onChange={(e) =>
+                setNewUserForm({
+                  ...newUserForm,
+                  role: e.target.value as StaffRole,
+                })
+              }
+            >
+              {ROLE_OPTIONS.map((r) => (
+                <option key={r.value} value={r.value}>
+                  {r.label}
+                </option>
+              ))}
+            </select>
+
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                className="border px-3 py-1 rounded text-sm"
+                onClick={() => setNewUserModalOpen(false)}
+              >
+                Cancel
+              </button>
+
+              <button
+                className="bg-blue-600 text-white px-3 py-1 rounded text-sm hover:bg-blue-700 disabled:opacity-50"
+                onClick={async () => {
+                  setCreatingUser(true);
+
+                  const res = await fetch("/api/users/create", {
+                    method: "POST",
+                    body: JSON.stringify(newUserForm),
+                  });
+
+                  setCreatingUser(false);
+
+                  if (!res.ok) {
+                    alert("Error creating user.");
+                    return;
+                  }
+
+                  alert("User created!");
+
+                  setNewUserModalOpen(false);
+                  setNewUserForm({
+                    email: "",
+                    full_name: "",
+                    role: "staff",
+                  });
+
+                  await loadStaff();
+                }}
+                disabled={creatingUser}
+              >
+                {creatingUser ? "Creating…" : "Create User"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

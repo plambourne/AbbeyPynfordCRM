@@ -16,7 +16,7 @@ export default function RootLayout({
   return (
     <html lang="en">
       {/* Full height + light background */}
-      <body className="min-h-screen bg-gray-100 text-gray-800">
+      <body className="min-h-screen bg-white-800 text-gray-800">
         {/* Main app shell: sidebar + content side by side */}
         <div className="flex min-h-screen">
           {/* Fixed‑width sidebar on the left */}
